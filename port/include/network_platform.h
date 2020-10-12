@@ -37,6 +37,22 @@
 extern "C" {
 #endif
 
+/* From Cryptoauthlib */
+#include "cryptoauthlib.h"
+#include "atcacert/atcacert_client.h"
+#include "mbedtls/atca_mbedtls_wrap.h"
+#include "atcacert/atcacert_def.h"
+
+/* Local Includes */
+#include "cert_chain.h"
+
+void get_atecc608cfg(ATCAIfaceCfg *cfg);
+
+
+uint8_t iokeyrandom[32];
+
+int atca_mbedtls_ecdh_ioprot_cb(uint8_t secret[32]);
+
 /**
  * @brief TLS Connection Parameters
  *

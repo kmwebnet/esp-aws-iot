@@ -14,6 +14,7 @@
  * permissions and limitations under the License.
  */
 #include <sys/param.h>
+#include <stdio.h>
 #include <stdbool.h>
 #include <string.h>
 #include <timer_platform.h>
@@ -26,11 +27,9 @@
 
 #include "mbedtls/esp_debug.h"
 
-#ifdef CONFIG_AWS_IOT_USE_HARDWARE_SECURE_ELEMENT
-#include "mbedtls/atca_mbedtls_wrap.h"
-#include "tng_atca.h"
-#include "tng_atcacert_client.h"
-#endif
+
+ATCAIfaceCfg atcacfg;
+extern uint8_t keynum;
 
 #include "esp_log.h"
 #include "esp_vfs.h"
@@ -144,14 +143,9 @@ IoT_Error_t iot_tls_connect(Network *pNetwork, TLSConnectParams *params) {
        very basic heuristic: if the cert starts with '/' then it's a
        path, if it's longer than this then it's raw cert data (PEM or DER,
        neither of which can start with a slash. */
-    if (pNetwork->tlsConnectParams.pRootCALocation[0] == '/') {
-        ESP_LOGD(TAG, "Loading CA root certificate from file ...");
-        ret = mbedtls_x509_crt_parse_file(&(tlsDataParams->cacert), pNetwork->tlsConnectParams.pRootCALocation);
-    } else {
-        ESP_LOGD(TAG, "Loading embedded CA root certificate ...");
-        ret = mbedtls_x509_crt_parse(&(tlsDataParams->cacert), (const unsigned char *)pNetwork->tlsConnectParams.pRootCALocation,
-                                 strlen(pNetwork->tlsConnectParams.pRootCALocation)+1);
-    }
+    ESP_LOGD(TAG, "Loading embedded CA root certificate ...");
+    ret = mbedtls_x509_crt_parse(&(tlsDataParams->cacert), (const unsigned char *)pNetwork->tlsConnectParams.pRootCALocation,
+                            strlen(pNetwork->tlsConnectParams.pRootCALocation)+1);
 
     if(ret < 0) {
         ESP_LOGE(TAG, "failed!  mbedtls_x509_crt_parse returned -0x%x while parsing root cert", -ret);
@@ -160,65 +154,42 @@ IoT_Error_t iot_tls_connect(Network *pNetwork, TLSConnectParams *params) {
     ESP_LOGD(TAG, "ok (%d skipped)", ret);
 
     /* Load client certificate... */
-#ifdef CONFIG_AWS_IOT_USE_HARDWARE_SECURE_ELEMENT
-    if (pNetwork->tlsConnectParams.pDeviceCertLocation[0] == '#') {
-        const atcacert_def_t* cert_def = NULL;
-        ESP_LOGD(TAG, "Using certificate stored in ATECC608A");
-        ret = tng_get_device_cert_def(&cert_def);
-        if (ret == 0) {
-            ret = atca_mbedtls_cert_add(&(tlsDataParams->clicert), cert_def);
-        } else {
-            ESP_LOGE(TAG, "failed! could not load cert from ATECC608A, tng_get_device_cert_def returned %02x", ret);
-        }
-    } else
-#endif
-    if (pNetwork->tlsConnectParams.pDeviceCertLocation[0] == '/') {
-        ESP_LOGD(TAG, "Loading client cert from file...");
-        ret = mbedtls_x509_crt_parse_file(&(tlsDataParams->clicert),
-                                          pNetwork->tlsConnectParams.pDeviceCertLocation);
-    } else {
-        ESP_LOGD(TAG, "Loading embedded client certificate...");
-        ret = mbedtls_x509_crt_parse(&(tlsDataParams->clicert),
-                                     (const unsigned char *)pNetwork->tlsConnectParams.pDeviceCertLocation,
-                                     strlen(pNetwork->tlsConnectParams.pDeviceCertLocation)+1);
+
+    get_atecc608cfg(&atcacfg);
+    ret = atcab_init(&atcacfg);
+    if (ret != 0)
+	{
+	    ESP_LOGE(TAG,"Failed to init ECC608\n");
     }
-    if(ret != 0) {
+
+    /* Extract the device certificate and convert to mbedtls cert */
+    ret = atca_mbedtls_cert_add(&(tlsDataParams->clicert), &g_cert_def_2_device);
+    if (ret != 0)
+    {
         ESP_LOGE(TAG, "failed!  mbedtls_x509_crt_parse returned -0x%x while parsing device cert", -ret);
         return NETWORK_X509_DEVICE_CRT_PARSE_ERROR;
     }
-
     /* Parse client private key... */
-#ifdef CONFIG_AWS_IOT_USE_HARDWARE_SECURE_ELEMENT
-    if (pNetwork->tlsConnectParams.pDevicePrivateKeyLocation[0] == '#') {
-        int8_t slot_id = pNetwork->tlsConnectParams.pDevicePrivateKeyLocation[1] - '0';
-        if (slot_id < 0 || slot_id > 9) {
-            ESP_LOGE(TAG, "Invalid ATECC608A slot ID.");
-            ret = NETWORK_PK_PRIVATE_KEY_PARSE_ERROR;
-        } else {
-            ESP_LOGD(TAG, "Using ATECC608A private key from slot %d", slot_id);
-            ret = atca_mbedtls_pk_init(&(tlsDataParams->pkey), slot_id);
-            if (ret != 0) {
-                ESP_LOGE(TAG, "failed !  atca_mbedtls_pk_init returned %02x", ret);
-            }
-        }
-    } else
-#endif
-    if (pNetwork->tlsConnectParams.pDevicePrivateKeyLocation[0] == '/') {
-        ESP_LOGD(TAG, "Loading client private key from file...");
-        ret = mbedtls_pk_parse_keyfile(&(tlsDataParams->pkey),
-                                       pNetwork->tlsConnectParams.pDevicePrivateKeyLocation,
-                                       "");
-    } else {
-        ESP_LOGD(TAG, "Loading embedded client private key...");
-        ret = mbedtls_pk_parse_key(&(tlsDataParams->pkey),
-                                   (const unsigned char *)pNetwork->tlsConnectParams.pDevicePrivateKeyLocation,
-                                   strlen(pNetwork->tlsConnectParams.pDevicePrivateKeyLocation)+1,
-                                   (const unsigned char *)"", 0);
-    }
-    if(ret != 0) {
+    ret = atca_mbedtls_pk_init(&(tlsDataParams->pkey),  (uint16_t)keynum);
+    if (ret != 0)
+    {
         ESP_LOGE(TAG, "failed!  mbedtls_pk_parse_key returned -0x%x while parsing private key", -ret);
         return NETWORK_PK_PRIVATE_KEY_PARSE_ERROR;
     }
+    /* Extract the signer certificate, convert, then attach to the chain */
+    atcab_release();
+    ret = atcab_init(&atcacfg);
+    if (ret != 0)
+	{
+	    ESP_LOGE(TAG,"Failed to init ECC608\n");
+    }
+    ret = atca_mbedtls_cert_add(&(tlsDataParams->clicert), &g_cert_def_1_signer);
+    if (ret != 0)
+    {
+        ESP_LOGE(TAG, "failed!  mbedtls_x509_crt_parse returned -0x%x while parsing signer CA cert", -ret);
+        return NETWORK_X509_DEVICE_CRT_PARSE_ERROR;
+    }
+
 
     /* Done parsing certs */
     ESP_LOGD(TAG, "ok");
@@ -253,11 +224,8 @@ IoT_Error_t iot_tls_connect(Network *pNetwork, TLSConnectParams *params) {
 
     mbedtls_ssl_conf_verify(&(tlsDataParams->conf), _iot_tls_verify_cert, NULL);
 
-    if(pNetwork->tlsConnectParams.ServerVerificationFlag == true) {
-        mbedtls_ssl_conf_authmode(&(tlsDataParams->conf), MBEDTLS_SSL_VERIFY_REQUIRED);
-    } else {
-        mbedtls_ssl_conf_authmode(&(tlsDataParams->conf), MBEDTLS_SSL_VERIFY_OPTIONAL);
-    }
+    mbedtls_ssl_conf_authmode(&(tlsDataParams->conf), MBEDTLS_SSL_VERIFY_REQUIRED);
+
     mbedtls_ssl_conf_rng(&(tlsDataParams->conf), mbedtls_ctr_drbg_random, &(tlsDataParams->ctr_drbg));
 
     mbedtls_ssl_conf_ca_chain(&(tlsDataParams->conf), &(tlsDataParams->cacert), NULL);
@@ -266,6 +234,13 @@ IoT_Error_t iot_tls_connect(Network *pNetwork, TLSConnectParams *params) {
         ESP_LOGE(TAG, "failed! mbedtls_ssl_conf_own_cert returned %d", ret);
         return SSL_CONNECTION_ERROR;
     }
+
+    // Set the allowed curves in order of preference.
+    static const mbedtls_ecp_group_id curve[] =
+    {
+        MBEDTLS_ECP_DP_SECP256R1, MBEDTLS_ECP_DP_NONE
+    };
+    mbedtls_ssl_conf_curves(&(tlsDataParams->conf), curve);
 
     mbedtls_ssl_conf_read_timeout(&(tlsDataParams->conf), pNetwork->tlsConnectParams.timeout_ms);
 
